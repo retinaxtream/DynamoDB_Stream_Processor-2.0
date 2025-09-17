@@ -104,6 +104,24 @@ export const handler = async (event, context) => {
 // Stream Record Processing
 // ===================================
 
+async function checkEmailJobExists(eventId, email) {
+  // Query all records for this event
+  const command = new QueryCommand({
+    TableName: 'face_match_results',
+    KeyConditionExpression: 'eventId = :eventId',
+    FilterExpression: 'guest_email = :email AND delivery_status IN (:processing, :delivered)',
+    ExpressionAttributeValues: {
+      ':eventId': { S: eventId },
+      ':email': { S: email.toLowerCase() },
+      ':processing': { S: 'processing' },
+      ':delivered': { S: 'delivered' }
+    }
+  });
+  
+  const result = await dynamoClient.send(command);
+  return result.Items && result.Items.length > 0;
+}
+
 async function processStreamRecord(record) {
   const { eventName, dynamodb } = record;
 
@@ -126,6 +144,21 @@ async function processStreamRecord(record) {
   }
 
   const matchResult = parseDynamoDBRecord(dynamodb.NewImage);
+
+   // Check if email job already exists
+   const emailExists = await checkEmailJobExists(
+    matchResult.eventId,
+    matchResult.guestEmail
+  );
+  
+  if (emailExists) {
+    console.log(`Email job already exists for ${matchResult.guestEmail}`);
+    return {
+      recordId: record.eventID,
+      action: 'duplicate_prevented',
+      reason: 'Email job already exists for this address'
+    };
+  }
 
   if (CONFIG.ENABLE_DEBUG_LOGGING) {
     console.log('   📋 Parsed match result:', JSON.stringify(matchResult, null, 2));
