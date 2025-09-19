@@ -3,7 +3,7 @@
 // Process face_match_results table changes and trigger email notifications
 // ===================================
 
-import { DynamoDBClient, UpdateItemCommand } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, UpdateItemCommand,QueryCommand } from '@aws-sdk/client-dynamodb';
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { CloudWatchClient, PutMetricDataCommand } from '@aws-sdk/client-cloudwatch';
 
@@ -105,22 +105,41 @@ export const handler = async (event, context) => {
 // ===================================
 
 async function checkEmailJobExists(eventId, email) {
-  // Query all records for this event
-  const command = new QueryCommand({
-    TableName: 'face_match_results',
-    KeyConditionExpression: 'eventId = :eventId',
-    FilterExpression: 'guest_email = :email AND delivery_status IN (:processing, :delivered)',
-    ExpressionAttributeValues: {
-      ':eventId': { S: eventId },
-      ':email': { S: email.toLowerCase() },
-      ':processing': { S: 'processing' },
-      ':delivered': { S: 'delivered' }
+  try {
+    console.log(`   🔍 Checking if email job exists for: ${email}`);
+    
+    const command = new QueryCommand({
+      TableName: 'face_match_results',
+      KeyConditionExpression: 'eventId = :eventId',
+      FilterExpression: 'guest_email = :email AND (delivery_status = :processing OR delivery_status = :delivered OR email_status = :sent)',
+      ExpressionAttributeValues: {
+        ':eventId': { S: eventId },
+        ':email': { S: email.toLowerCase() },
+        ':processing': { S: 'processing' },
+        ':delivered': { S: 'delivered' },
+        ':sent': { S: 'sent' }
+      }
+    });
+    
+    const result = await dynamoClient.send(command);
+    const exists = result.Items && result.Items.length > 0;
+    
+    if (exists) {
+      console.log(`   ⚠️ Found existing email job for ${email}`);
+      console.log(`   Existing records: ${result.Items.length}`);
+      result.Items.forEach(item => {
+        console.log(`     - guestId: ${item.guestId?.S}, status: ${item.delivery_status?.S || item.email_status?.S}`);
+      });
     }
-  });
-  
-  const result = await dynamoClient.send(command);
-  return result.Items && result.Items.length > 0;
+    
+    return exists;
+  } catch (error) {
+    console.error(`   ❌ Error checking email job existence: ${error.message}`);
+    // Don't fail the entire process if check fails
+    return false;
+  }
 }
+
 
 async function processStreamRecord(record) {
   const { eventName, dynamodb } = record;
@@ -145,6 +164,34 @@ async function processStreamRecord(record) {
 
   const matchResult = parseDynamoDBRecord(dynamodb.NewImage);
 
+    // CRITICAL FIX: Check if email was already sent in the CURRENT record
+    if (matchResult.email_status === 'sent' || matchResult.email_sent === true) {
+      console.log(`   ✅ Email already sent for ${matchResult.guestEmail} (status: ${matchResult.email_status})`);
+      return {
+        recordId: record.eventID,
+        action: 'skipped',
+        reason: 'Email already sent - found in current record'
+      };
+    }
+
+      // For MODIFY events, also check the OLD image to see if email was already sent
+  if (eventName === 'MODIFY' && dynamodb?.OldImage) {
+    const oldRecord = parseDynamoDBRecord(dynamodb.OldImage);
+    
+    if (oldRecord.email_status === 'sent' || oldRecord.email_sent === true) {
+      console.log(`   ✅ Email was already sent in previous version for ${matchResult.guestEmail}`);
+      return {
+        recordId: record.eventID,
+        action: 'skipped',
+        reason: 'Email already sent - found in old record'
+      };
+    }
+  }
+
+  if (CONFIG.ENABLE_DEBUG_LOGGING) {
+    console.log('   📋 Parsed match result:', JSON.stringify(matchResult, null, 2));
+  }
+
    // Check if email job already exists
    const emailExists = await checkEmailJobExists(
     matchResult.eventId,
@@ -152,7 +199,11 @@ async function processStreamRecord(record) {
   );
   
   if (emailExists) {
-    console.log(`Email job already exists for ${matchResult.guestEmail}`);
+    console.log(`   🚫 Email job already exists for ${matchResult.guestEmail}`);
+    
+    // Update the record to show it's been processed
+    await markAsProcessed(matchResult.eventId, matchResult.guestId);
+    
     return {
       recordId: record.eventID,
       action: 'duplicate_prevented',
@@ -189,8 +240,10 @@ async function processStreamRecord(record) {
   }
 
   console.log(`   ✅ Email criteria met for guest ${matchResult.guestId}`);
+  console.log(`      - Email: ${matchResult.guestEmail}`);
   console.log(`      - Total matches: ${matchResult.totalMatches}`);
   console.log(`      - Current delivery status: ${matchResult.deliveryStatus || 'none'}`);
+
 
   const updateResult = await updateDeliveryStatusToProcessing(
     matchResult.eventId,
@@ -212,7 +265,7 @@ async function processStreamRecord(record) {
   console.log('   🔄 Delivery status updated to "processing"');
 
   const emailJob = createEmailJob(matchResult);
-  const sqsResult = await sendEmailJobToQueue(emailJob);
+  const sqsResult = await sendEmailJobToQueueWithDedup(emailJob);
 
   if (sqsResult.success) {
     console.log(`   📧 Email job queued successfully: ${sqsResult.messageId}`);
@@ -230,6 +283,131 @@ async function processStreamRecord(record) {
   }
 }
 
+
+// New function to mark duplicate records as processed
+async function markAsProcessed(eventId, guestId) {
+  try {
+    const command = new UpdateItemCommand({
+      TableName: 'face_match_results',
+      Key: {
+        eventId: { S: eventId },
+        guestId: { S: guestId },
+      },
+      UpdateExpression: 'SET delivery_status = :delivered, duplicate_detected_at = :timestamp',
+      ExpressionAttributeValues: {
+        ':delivered': { S: 'delivered' },
+        ':timestamp': { S: new Date().toISOString() }
+      }
+    });
+    
+    await dynamoClient.send(command);
+    console.log(`   ✅ Marked duplicate record ${guestId} as delivered`);
+  } catch (error) {
+    console.error(`   ⚠️ Failed to mark duplicate as processed: ${error.message}`);
+  }
+}
+
+
+// Enhanced update function with email tracking
+async function updateDeliveryStatusToProcessingWithEmailCheck(eventId, guestId, email, currentStatus) {
+  try {
+    // Store the email being processed to prevent duplicates
+    let conditionExpression;
+    let expressionAttributeValues = {
+      ':processing': { S: 'processing' },
+      ':timestamp': { S: new Date().toISOString() },
+      ':email': { S: email.toLowerCase() }
+    };
+
+    if (!currentStatus || currentStatus === 'pending') {
+      conditionExpression =
+        'attribute_not_exists(delivery_status) OR delivery_status = :pending';
+      expressionAttributeValues[':pending'] = { S: 'pending' };
+    } else {
+      conditionExpression = 'delivery_status = :currentStatus';
+      expressionAttributeValues[':currentStatus'] = { S: currentStatus };
+    }
+
+    const updateCommand = new UpdateItemCommand({
+      TableName: 'face_match_results',
+      Key: {
+        eventId: { S: eventId },
+        guestId: { S: guestId },
+      },
+      UpdateExpression:
+        'SET delivery_status = :processing, email_triggered_at = :timestamp, processing_email = :email',
+      ConditionExpression: conditionExpression,
+      ExpressionAttributeValues: expressionAttributeValues,
+      ReturnValues: 'ALL_NEW',
+    });
+
+    const result = await dynamoClient.send(updateCommand);
+
+    return { success: true, updatedItem: result.Attributes };
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') {
+      return {
+        success: false,
+        reason: 'Delivery status already changed (race condition prevented)',
+        errorType: 'conditional_check_failed',
+      };
+    }
+    console.error('Error updating delivery status:', error);
+    return {
+      success: false,
+      reason: `Database error: ${error.message}`,
+      errorType: 'database_error',
+    };
+  }
+}
+
+// Enhanced SQS function with deduplication
+async function sendEmailJobToQueueWithDedup(emailJob) {
+  try {
+    const dedupId = `${emailJob.eventId}-${emailJob.guestInfo.email.toLowerCase()}`;
+    
+    const message = {
+      id: `email_${emailJob.eventId}_${emailJob.guestId}_${Date.now()}`,
+      type: 'photo_match_notification',
+      payload: emailJob,
+      metadata: {
+        queuedAt: new Date().toISOString(),
+        version: '1.0',
+        dedupId: dedupId
+      },
+    };
+
+    const command = new SendMessageCommand({
+      QueueUrl: CONFIG.EMAIL_QUEUE_URL,
+      MessageBody: JSON.stringify(message),
+      MessageAttributes: {
+        messageType: { DataType: 'String', StringValue: 'photo_match_notification' },
+        eventId: { DataType: 'String', StringValue: emailJob.eventId },
+        guestId: { DataType: 'String', StringValue: emailJob.guestId },
+        guestEmail: { DataType: 'String', StringValue: emailJob.guestInfo.email.toLowerCase() },
+        priority: { DataType: 'String', StringValue: emailJob.jobMetadata.priority },
+        totalMatches: {
+          DataType: 'Number',
+          StringValue: emailJob.matchInfo.totalMatches.toString(),
+        },
+      },
+      DelaySeconds: emailJob.jobMetadata.priority === 'high' ? 0 : 5,
+      // If using FIFO queue, add these:
+      // MessageDeduplicationId: dedupId,
+      // MessageGroupId: emailJob.eventId
+    });
+
+    const result = await sqsClient.send(command);
+    
+    console.log(`   ✅ SQS message sent with dedupId: ${dedupId}`);
+
+    return { success: true, messageId: result.MessageId, message: 'Email job queued successfully' };
+  } catch (error) {
+    console.error('Error sending message to SQS:', error);
+    return { success: false, error: error.message, errorType: error.name };
+  }
+}
+
 // ===================================
 // Data Parsing and Validation
 // ===================================
@@ -242,6 +420,13 @@ function parseDynamoDBRecord(newImage) {
       guestName: newImage.guest_name?.S,
       guestEmail: newImage.guest_email?.S,
       guestPhone: newImage.guest_phone?.S,
+      
+      // ADD THESE FIELDS
+      email_status: newImage.email_status?.S,
+      email_sent: newImage.email_sent?.BOOL,
+      whatsapp_status: newImage.whatsapp_status?.S,
+      whatsapp_sent: newImage.whatsapp_sent?.BOOL,
+      
       guestSelfieUrl: newImage.guest_selfie_url?.S,
       guestRegistrationId: newImage.guest_registration_id?.S,
       totalMatches: parseInt(newImage.total_matches?.N || '0'),
