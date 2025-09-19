@@ -470,8 +470,15 @@ function isValidEmail(email) {
 // ===================================
 // Business Logic
 // ===================================
-
 function evaluateEmailCriteria(matchResult) {
+  // CRITICAL: Check email_status FIRST
+  if (matchResult.email_status === 'sent' || matchResult.email_sent === true) {
+    return { 
+      send: false, 
+      reason: 'Email already sent (email_status check)' 
+    };
+  }
+
   if (matchResult.totalMatches < CONFIG.MIN_MATCHES_FOR_EMAIL) {
     return {
       send: false,
@@ -481,7 +488,7 @@ function evaluateEmailCriteria(matchResult) {
 
   const status = matchResult.deliveryStatus;
   if (status === 'delivered') {
-    return { send: false, reason: 'Email already delivered' };
+    return { send: false, reason: 'Email already delivered (delivery_status)' };
   }
   if (status === 'processing') {
     return { send: false, reason: 'Email delivery already in progress' };
@@ -577,6 +584,18 @@ async function revertDeliveryStatus(eventId, guestId) {
     console.error('❌ Failed to revert delivery status:', error);
   }
 }
+
+// Right before calling createEmailJob, add one final check:
+if (matchResult.email_status === 'sent' || matchResult.email_sent === true) {
+  console.log('   🛑 FINAL CHECK: Email already sent, aborting SQS message creation');
+  return {
+    recordId: record.eventID,
+    action: 'skipped',
+    reason: 'Email already sent - final check before SQS'
+  };
+}
+
+const emailJob = createEmailJob(matchResult);
 
 // ===================================
 // SQS Operations
