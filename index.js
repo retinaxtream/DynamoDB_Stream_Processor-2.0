@@ -173,16 +173,49 @@ async function processStreamRecord(record) {
     };
   }
 
-  // For MODIFY events, also check the OLD image to see if email was already sent
+  // Check if delivery status indicates email was already processed
+  if (matchResult.deliveryStatus === 'delivered') {
+    console.log(`   ✅ Email already delivered for ${matchResult.guestEmail} (delivery_status: delivered)`);
+    return {
+      recordId: record.eventID,
+      action: 'skipped',
+      reason: 'Email already delivered - delivery_status check'
+    };
+  }
+
+  // For MODIFY events, check if this is just a pool expansion update with no new matches
   if (eventName === 'MODIFY' && dynamodb?.OldImage) {
     const oldRecord = parseDynamoDBRecord(dynamodb.OldImage);
-    
+
+    // If email was already sent in previous version, skip
     if (oldRecord.email_status === 'sent' || oldRecord.email_sent === true) {
       console.log(`   ✅ Email was already sent in previous version for ${matchResult.guestEmail}`);
       return {
         recordId: record.eventID,
         action: 'skipped',
         reason: 'Email already sent - found in old record'
+      };
+    }
+
+    // If delivery status was already delivered, skip
+    if (oldRecord.deliveryStatus === 'delivered') {
+      console.log(`   ✅ Email was already delivered in previous version for ${matchResult.guestEmail}`);
+      return {
+        recordId: record.eventID,
+        action: 'skipped',
+        reason: 'Email already delivered - old record check'
+      };
+    }
+
+    // CRITICAL: If this is a MODIFY event with 0 new matches, this is just a pool expansion update
+    // Don't send another email for the same existing matches
+    if (matchResult.newMatches === 0 && oldRecord.totalMatches > 0) {
+      console.log(`   ⏭️  MODIFY event with 0 new matches (pool expansion update) - skipping email for ${matchResult.guestEmail}`);
+      console.log(`      Total matches: ${matchResult.totalMatches}, New matches: ${matchResult.newMatches}`);
+      return {
+        recordId: record.eventID,
+        action: 'skipped',
+        reason: 'Pool expansion update with no new matches - email already sent for existing matches'
       };
     }
   }
